@@ -80,6 +80,7 @@ export default function App() {
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const photoPollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const wsRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pairingResolvedRef = useRef(false);
 
   useEffect(() => {
     const bootstrap = async () => {
@@ -152,6 +153,10 @@ export default function App() {
         if (wsRetryTimerRef.current) clearTimeout(wsRetryTimerRef.current);
         wsRetryTimerRef.current = setTimeout(connectPairingWs, retryDelayMs);
       };
+
+      ws.onerror = () => {
+        // Browser may log transient socket errors; reconnect + polling handle recovery.
+      };
     };
 
     void refreshLatestPhoto(pairing);
@@ -194,6 +199,9 @@ export default function App() {
   }, [photo, remainingSeconds]);
 
   const finalizePairing = async (state: PairingState) => {
+    if (pairingResolvedRef.current) return;
+    pairingResolvedRef.current = true;
+
     await savePairingState(state);
     setPairing(state);
     setGeneratedCode(null);
@@ -215,6 +223,7 @@ export default function App() {
     }
 
     try {
+      pairingResolvedRef.current = false;
       setBusy(true);
       setPairingError(null);
 
@@ -228,6 +237,7 @@ export default function App() {
         try {
           const payload = JSON.parse(event.data);
           if (payload.event === "pairing_matched") {
+            if (pairingResolvedRef.current) return;
             finalizePairing({
               pairingId: payload.pairing_id,
               authToken: payload.auth_token,
@@ -240,9 +250,14 @@ export default function App() {
         }
       };
 
+      ws.onerror = () => {
+        // Pairing status polling remains active as fallback.
+      };
+
       if (pollTimerRef.current) clearInterval(pollTimerRef.current);
       pollTimerRef.current = setInterval(async () => {
         try {
+          if (pairingResolvedRef.current) return;
           const status = await checkPairStatus(data.code);
           if (status.matched && status.pairing_id && status.auth_token) {
             await finalizePairing({
@@ -277,6 +292,7 @@ export default function App() {
     }
 
     try {
+      pairingResolvedRef.current = false;
       setBusy(true);
       setPairingError(null);
 

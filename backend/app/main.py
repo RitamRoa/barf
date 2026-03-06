@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -329,7 +330,10 @@ async def ws_pairing_code(websocket: WebSocket, code: str) -> None:
 
     try:
         while True:
-            await websocket.receive_text()
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=25)
+            except asyncio.TimeoutError:
+                await websocket.send_json({"event": "keepalive"})
     except WebSocketDisconnect:
         hub.disconnect(room, websocket)
 
@@ -357,6 +361,9 @@ async def ws_pairing(websocket: WebSocket, pairing_id: str) -> None:
 
     try:
         while True:
-            await websocket.receive_text()
+            try:
+                await asyncio.wait_for(websocket.receive_text(), timeout=25)
+            except asyncio.TimeoutError:
+                await websocket.send_json({"event": "keepalive"})
     except WebSocketDisconnect:
         hub.disconnect(room, websocket)
