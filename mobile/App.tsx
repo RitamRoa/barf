@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   Image,
+  Modal,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -70,6 +71,9 @@ export default function App() {
 
   const [photo, setPhoto] = useState<UiPhoto | null>(null);
   const [clock, setClock] = useState(Date.now());
+  const [ttlPreset, setTtlPreset] = useState<"1h" | "6h" | "24h" | "custom">("24h");
+  const [customHoursInput, setCustomHoursInput] = useState("48");
+  const [viewerVisible, setViewerVisible] = useState(false);
 
   const pairCodeWsRef = useRef<WebSocket | null>(null);
   const pairWsRef = useRef<WebSocket | null>(null);
@@ -81,7 +85,11 @@ export default function App() {
     const bootstrap = async () => {
       const stored = await getPairingState();
       if (stored) {
-        setPairing(stored);
+        if (stored.authToken) {
+          setPairing(stored);
+        } else {
+          await clearPairingState();
+        }
       }
       setLoading(false);
     };
@@ -97,9 +105,9 @@ export default function App() {
     };
   }, []);
 
-  const refreshLatestPhoto = async (pairingId: string) => {
+  const refreshLatestPhoto = async (state: PairingState) => {
     try {
-      const res = await checkPhoto(pairingId);
+      const res = await checkPhoto(state.pairingId, state.authToken);
       if (res.has_photo) {
         setPhoto(toUiPhoto(res));
       } else {
@@ -119,7 +127,7 @@ export default function App() {
     const connectPairingWs = () => {
       if (cancelled) return;
 
-      const ws = new WebSocket(pairingWsUrl(pairing.pairingId));
+      const ws = new WebSocket(pairingWsUrl(pairing.pairingId, pairing.authToken));
       pairWsRef.current = ws;
 
       ws.onopen = () => {
@@ -146,12 +154,12 @@ export default function App() {
       };
     };
 
-    void refreshLatestPhoto(pairing.pairingId);
+    void refreshLatestPhoto(pairing);
     connectPairingWs();
 
     if (photoPollTimerRef.current) clearInterval(photoPollTimerRef.current);
     photoPollTimerRef.current = setInterval(() => {
-      void refreshLatestPhoto(pairing.pairingId);
+      void refreshLatestPhoto(pairing);
     }, 15000);
 
     return () => {
@@ -222,6 +230,7 @@ export default function App() {
           if (payload.event === "pairing_matched") {
             finalizePairing({
               pairingId: payload.pairing_id,
+              authToken: payload.auth_token,
               userName: cleanName,
               partnerName: payload.partner_name
             }).catch(() => {});
@@ -235,9 +244,10 @@ export default function App() {
       pollTimerRef.current = setInterval(async () => {
         try {
           const status = await checkPairStatus(data.code);
-          if (status.matched && status.pairing_id) {
+          if (status.matched && status.pairing_id && status.auth_token) {
             await finalizePairing({
               pairingId: status.pairing_id,
+              authToken: status.auth_token,
               userName: cleanName,
               partnerName: status.partner_name
             });
@@ -273,6 +283,7 @@ export default function App() {
       const data = await joinPairCode(cleanName, cleanCode);
       await finalizePairing({
         pairingId: data.pairing_id,
+        authToken: data.auth_token,
         userName: cleanName,
         partnerName: data.partner_name
       });
@@ -283,20 +294,51 @@ export default function App() {
     }
   };
 
-  const pickAndSendPhoto = async () => {
+  const resolveTtlHours = (): number | null => {
+    if (ttlPreset === "1h") return 1;
+    if (ttlPreset === "6h") return 6;
+    if (ttlPreset === "24h") return 24;
+    const parsed = Number.parseInt(customHoursInput.trim(), 10);
+    if (!Number.isFinite(parsed) || parsed < 1) return null;
+    return Math.min(parsed, 168);
+  };
+
+  const pickAndSendPhoto = async (source: "camera" | "library") => {
     if (!pairing) return;
 
-    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!permission.granted) {
-      Alert.alert("Permission needed", "Allow photo library access to share pictures.");
+    const ttlHours = resolveTtlHours();
+    if (!ttlHours) {
+      Alert.alert("Invalid duration", "Set custom hours to a number >= 1.");
       return;
     }
 
-    const selected = await ImagePicker.launchImageLibraryAsync({
-      allowsEditing: true,
-      quality: 0.85,
-      mediaTypes: ["images"]
-    });
+    let selected: ImagePicker.ImagePickerResult;
+
+    if (source === "camera") {
+      const permission = await ImagePicker.requestCameraPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert("Permission needed", "Allow camera access to capture photos.");
+        return;
+      }
+
+      selected = await ImagePicker.launchCameraAsync({
+        allowsEditing: true,
+        quality: 0.85,
+        mediaTypes: ["images"]
+      });
+    } else {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert("Permission needed", "Allow photo library access to share pictures.");
+        return;
+      }
+
+      selected = await ImagePicker.launchImageLibraryAsync({
+        allowsEditing: true,
+        quality: 0.85,
+        mediaTypes: ["images"]
+      });
+    }
 
     if (selected.canceled || selected.assets.length === 0) return;
 
@@ -307,14 +349,14 @@ export default function App() {
       setBusy(true);
       await uploadPhoto({
         pairingId: pairing.pairingId,
-        senderName: pairing.userName,
+        authToken: pairing.authToken,
         imageUri: asset.uri,
         mimeType,
-        ttlHours: 24
+        ttlHours
       });
 
       // Pull the saved object so sender and receiver see exactly the same data.
-      const latest = await checkPhoto(pairing.pairingId);
+      const latest = await checkPhoto(pairing.pairingId, pairing.authToken);
       if (latest.has_photo) {
         setPhoto(toUiPhoto(latest));
       }
@@ -426,9 +468,12 @@ export default function App() {
 
           {photo ? (
             <>
-              <Image source={{ uri: `data:${photo.mimeType};base64,${photo.imageB64}` }} style={styles.photo} />
+              <Pressable onPress={() => setViewerVisible(true)}>
+                <Image source={{ uri: `data:${photo.mimeType};base64,${photo.imageB64}` }} style={styles.photo} />
+              </Pressable>
               <Text style={styles.metaText}>from {photo.senderName}</Text>
               <Text style={styles.timerText}>Expires in {formatRemaining(remainingSeconds)}</Text>
+              <Text style={styles.photoHint}>Tap photo to view larger</Text>
             </>
           ) : (
             <View style={styles.emptyState}>
@@ -436,15 +481,61 @@ export default function App() {
             </View>
           )}
 
-          <Pressable onPress={pickAndSendPhoto} style={[styles.primaryButton, busy && styles.buttonDisabled]} disabled={busy}>
-            <Text style={styles.primaryButtonText}>Send New Photo</Text>
-          </Pressable>
+          <View style={styles.ttlWrap}>
+            <Text style={styles.metaText}>Photo duration</Text>
+            <View style={styles.ttlRow}>
+              {[
+                { key: "1h", label: "1h" },
+                { key: "6h", label: "6h" },
+                { key: "24h", label: "24h" },
+                { key: "custom", label: "Custom" }
+              ].map((item) => (
+                <Pressable
+                  key={item.key}
+                  onPress={() => setTtlPreset(item.key as "1h" | "6h" | "24h" | "custom")}
+                  style={[styles.ttlChip, ttlPreset === item.key && styles.ttlChipActive]}
+                >
+                  <Text style={[styles.ttlChipText, ttlPreset === item.key && styles.ttlChipTextActive]}>{item.label}</Text>
+                </Pressable>
+              ))}
+            </View>
+
+            {ttlPreset === "custom" ? (
+              <TextInput
+                value={customHoursInput}
+                onChangeText={(v) => setCustomHoursInput(v.replace(/[^0-9]/g, "").slice(0, 3))}
+                placeholder="Hours (1-168)"
+                placeholderTextColor={theme.colors.textSecondary}
+                style={styles.input}
+                keyboardType="number-pad"
+              />
+            ) : null}
+          </View>
+
+          <View style={styles.actionRow}>
+            <Pressable onPress={() => pickAndSendPhoto("camera")} style={[styles.primaryButton, styles.actionButton, busy && styles.buttonDisabled]} disabled={busy}>
+              <Text style={styles.primaryButtonText}>Camera</Text>
+            </Pressable>
+
+            <Pressable onPress={() => pickAndSendPhoto("library")} style={[styles.primaryButton, styles.actionButton, busy && styles.buttonDisabled]} disabled={busy}>
+              <Text style={styles.primaryButtonText}>Gallery</Text>
+            </Pressable>
+          </View>
 
           <Pressable onPress={resetPairing} style={styles.ghostButton}>
             <Text style={styles.ghostButtonText}>Reset local pairing</Text>
           </Pressable>
         </View>
       </ScrollView>
+
+      <Modal visible={viewerVisible} transparent animationType="fade" onRequestClose={() => setViewerVisible(false)}>
+        <View style={styles.viewerBackdrop}>
+          <Pressable style={styles.viewerDismiss} onPress={() => setViewerVisible(false)}>
+            <Text style={styles.viewerDismissText}>Close</Text>
+          </Pressable>
+          {photo ? <Image source={{ uri: `data:${photo.mimeType};base64,${photo.imageB64}` }} style={styles.viewerImage} /> : null}
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -621,6 +712,45 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: "700"
   },
+  photoHint: {
+    color: theme.colors.textSecondary,
+    fontSize: 12
+  },
+  ttlWrap: {
+    gap: theme.spacing.sm
+  },
+  ttlRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: theme.spacing.xs
+  },
+  ttlChip: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: "#121212",
+    paddingVertical: 8,
+    paddingHorizontal: 12
+  },
+  ttlChipActive: {
+    backgroundColor: theme.colors.accent,
+    borderColor: theme.colors.accent
+  },
+  ttlChipText: {
+    color: theme.colors.textSecondary,
+    fontSize: 12,
+    fontWeight: "600"
+  },
+  ttlChipTextActive: {
+    color: "#1B1A17"
+  },
+  actionRow: {
+    flexDirection: "row",
+    gap: theme.spacing.sm
+  },
+  actionButton: {
+    flex: 1
+  },
   emptyState: {
     borderRadius: theme.radius.lg,
     borderWidth: 1,
@@ -642,5 +772,35 @@ const styles = StyleSheet.create({
   ghostButtonText: {
     color: theme.colors.textSecondary,
     fontSize: 13
+  },
+  viewerBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.9)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: theme.spacing.md
+  },
+  viewerImage: {
+    width: "100%",
+    height: "82%",
+    borderRadius: theme.radius.lg,
+    resizeMode: "contain"
+  },
+  viewerDismiss: {
+    position: "absolute",
+    top: 52,
+    right: 24,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: "#121212",
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 999,
+    zIndex: 10
+  },
+  viewerDismissText: {
+    color: theme.colors.textPrimary,
+    fontSize: 12,
+    fontWeight: "700"
   }
 });

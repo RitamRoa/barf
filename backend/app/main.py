@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import hmac
 import json
 import random
 from datetime import UTC, datetime
@@ -97,6 +99,47 @@ def photo_key(pairing_id: str) -> str:
     return f"photo:{pairing_id}"
 
 
+def _token_signature(payload_b64: str) -> str:
+    secret = settings.pairing_token_secret.encode("utf-8")
+    digest = hmac.new(secret, payload_b64.encode("ascii"), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def issue_pairing_token(*, pairing_id: str, user_name: str) -> str:
+    payload = {
+        "pairing_id": pairing_id,
+        "user_name": user_name,
+        "iat": utc_now_iso(),
+    }
+    payload_json = json.dumps(payload, separators=(",", ":"))
+    payload_b64 = base64.urlsafe_b64encode(payload_json.encode("utf-8")).decode("ascii").rstrip("=")
+    signature = _token_signature(payload_b64)
+    return f"{payload_b64}.{signature}"
+
+
+def verify_pairing_token(token: str) -> dict[str, Any]:
+    try:
+        payload_b64, signature = token.split(".", 1)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="Invalid auth token") from exc
+
+    expected = _token_signature(payload_b64)
+    if not hmac.compare_digest(signature, expected):
+        raise HTTPException(status_code=401, detail="Invalid auth token")
+
+    padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+    try:
+        payload_raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        payload = json.loads(payload_raw)
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid auth token") from exc
+
+    if not payload.get("pairing_id") or not payload.get("user_name"):
+        raise HTTPException(status_code=401, detail="Invalid auth token")
+
+    return payload
+
+
 async def reserve_unique_code(r: redis.Redis) -> str:
     for _ in range(20):
         code = f"{random.randint(0, 999999):06d}"
@@ -139,11 +182,17 @@ async def join_code(body: JoinCodeRequest) -> dict[str, Any]:
 
     waiting = json.loads(raw)
     pairing_id = str(uuid4())
+    initiator_name = waiting["initiator_name"]
+    joiner_name = body.name.strip()
+    initiator_token = issue_pairing_token(pairing_id=pairing_id, user_name=initiator_name)
+    joiner_token = issue_pairing_token(pairing_id=pairing_id, user_name=joiner_name)
 
     result = {
         "pairing_id": pairing_id,
-        "initiator_name": waiting["initiator_name"],
-        "joiner_name": body.name.strip(),
+        "initiator_name": initiator_name,
+        "joiner_name": joiner_name,
+        "initiator_auth_token": initiator_token,
+        "joiner_auth_token": joiner_token,
         "matched_at": utc_now_iso(),
     }
 
@@ -155,13 +204,15 @@ async def join_code(body: JoinCodeRequest) -> dict[str, Any]:
         payload={
             "event": "pairing_matched",
             "pairing_id": pairing_id,
-            "partner_name": body.name.strip(),
+            "partner_name": joiner_name,
+            "auth_token": initiator_token,
         },
     )
 
     return {
         "pairing_id": pairing_id,
-        "partner_name": waiting["initiator_name"],
+        "partner_name": initiator_name,
+        "auth_token": joiner_token,
     }
 
 
@@ -179,6 +230,7 @@ async def pairing_status(code: str) -> dict[str, Any]:
             "matched": True,
             "pairing_id": result["pairing_id"],
             "partner_name": result["joiner_name"],
+            "auth_token": result["initiator_auth_token"],
             "expires_in_seconds": max(ttl, 0),
         }
 
@@ -192,7 +244,7 @@ async def pairing_status(code: str) -> dict[str, Any]:
 @app.post("/photo/upload", response_model=UploadResponse)
 async def upload_photo(
     pairing_id: str = Form(...),
-    sender_name: str = Form(...),
+    auth_token: str = Form(...),
     ttl_hours: int = Form(24),
     image: UploadFile = File(...),
 ) -> UploadResponse:
@@ -203,6 +255,11 @@ async def upload_photo(
 
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image uploads are allowed")
+
+    token_payload = verify_pairing_token(auth_token)
+    if token_payload["pairing_id"] != pairing_id:
+        raise HTTPException(status_code=403, detail="Token does not match pairing")
+    sender_name = str(token_payload["user_name"]).strip()
 
     raw_image = await image.read()
     if len(raw_image) > settings.max_upload_size_bytes:
@@ -237,7 +294,11 @@ async def upload_photo(
 
 
 @app.get("/check_photo/{pairing_id}")
-async def check_photo(pairing_id: str) -> dict[str, Any]:
+async def check_photo(pairing_id: str, auth_token: str) -> dict[str, Any]:
+    token_payload = verify_pairing_token(auth_token)
+    if token_payload["pairing_id"] != pairing_id:
+        raise HTTPException(status_code=403, detail="Token does not match pairing")
+
     r: redis.Redis = app.state.redis
     raw = await r.get(photo_key(pairing_id))
     if not raw:
@@ -275,6 +336,21 @@ async def ws_pairing_code(websocket: WebSocket, code: str) -> None:
 
 @app.websocket("/ws/pairing/{pairing_id}")
 async def ws_pairing(websocket: WebSocket, pairing_id: str) -> None:
+    auth_token = websocket.query_params.get("auth_token")
+    if not auth_token:
+        await websocket.close(code=1008)
+        return
+
+    try:
+        token_payload = verify_pairing_token(auth_token)
+    except HTTPException:
+        await websocket.close(code=1008)
+        return
+
+    if token_payload["pairing_id"] != pairing_id:
+        await websocket.close(code=1008)
+        return
+
     room = f"pairing:{pairing_id}"
     await hub.connect(room, websocket)
     await websocket.send_json({"event": "connected", "room": room})

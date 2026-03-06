@@ -9,6 +9,7 @@ export type PhotoPayload = {
 
 export type PairingState = {
   pairingId: string;
+  authToken: string;
   userName: string;
   partnerName?: string;
 };

@@ -18,7 +18,7 @@ export async function createPairCode(name: string): Promise<{ code: string; expi
   return res.json();
 }
 
-export async function joinPairCode(name: string, code: string): Promise<{ pairing_id: string; partner_name: string }> {
+export async function joinPairCode(name: string, code: string): Promise<{ pairing_id: string; partner_name: string; auth_token: string }> {
   const res = await fetch(`${API_BASE}/pairing/join-code`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -29,7 +29,7 @@ export async function joinPairCode(name: string, code: string): Promise<{ pairin
   return res.json();
 }
 
-export async function checkPairStatus(code: string): Promise<{ matched: boolean; pairing_id?: string; partner_name?: string; expired?: boolean }> {
+export async function checkPairStatus(code: string): Promise<{ matched: boolean; pairing_id?: string; partner_name?: string; auth_token?: string; expired?: boolean }> {
   const res = await fetch(`${API_BASE}/pairing/status/${code}`);
   if (!res.ok) throw new Error("Could not check pairing status");
   return res.json();
@@ -37,14 +37,14 @@ export async function checkPairStatus(code: string): Promise<{ matched: boolean;
 
 export async function uploadPhoto(params: {
   pairingId: string;
-  senderName: string;
+  authToken: string;
   imageUri: string;
   mimeType: string;
   ttlHours: number;
 }): Promise<{ pairing_id: string; expires_in_seconds: number }> {
   const form = new FormData();
   form.append("pairing_id", params.pairingId);
-  form.append("sender_name", params.senderName);
+  form.append("auth_token", params.authToken);
   form.append("ttl_hours", String(params.ttlHours));
 
   form.append("image", {
@@ -62,8 +62,11 @@ export async function uploadPhoto(params: {
   return res.json();
 }
 
-export async function checkPhoto(pairingId: string): Promise<{ has_photo: false } | ({ has_photo: true } & PhotoPayload)> {
-  const res = await fetch(`${API_BASE}/check_photo/${pairingId}`);
+export async function checkPhoto(
+  pairingId: string,
+  authToken: string
+): Promise<{ has_photo: false } | ({ has_photo: true } & PhotoPayload)> {
+  const res = await fetch(`${API_BASE}/check_photo/${pairingId}?auth_token=${encodeURIComponent(authToken)}`);
   if (!res.ok) throw new Error("Could not check photo");
   return res.json();
 }
@@ -73,7 +76,7 @@ export function pairingCodeWsUrl(code: string): string {
   return `${wsBase}/ws/pairing-code/${code}`;
 }
 
-export function pairingWsUrl(pairingId: string): string {
+export function pairingWsUrl(pairingId: string, authToken: string): string {
   const wsBase = API_BASE.replace(/^http/, "ws");
-  return `${wsBase}/ws/pairing/${pairingId}`;
+  return `${wsBase}/ws/pairing/${pairingId}?auth_token=${encodeURIComponent(authToken)}`;
 }

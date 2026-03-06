@@ -3,6 +3,7 @@
 A minimal couple photo-sharing app:
 - Pair once with a 6-digit code
 - Store pairing UUID locally on both devices
+- Store a signed pairing auth token locally on both devices
 - Share exactly one active photo per pair
 - Auto-expire photos with Redis TTL (24h by default)
 - Live updates through WebSocket, plus polling fallback
@@ -49,22 +50,25 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 - `POST /pairing/join-code`
   - body: `{ "name": "B", "code": "123456" }`
-  - returns: `{ pairing_id, partner_name }`
+  - returns: `{ pairing_id, partner_name, auth_token }`
 
 - `GET /pairing/status/{code}`
   - poll fallback for creator device
+  - when matched, returns: `{ matched, pairing_id, partner_name, auth_token }`
 
 - `POST /photo/upload` (multipart)
-  - fields: `pairing_id`, `sender_name`, `ttl_hours`, `image`
+  - fields: `pairing_id`, `auth_token`, `ttl_hours`, `image`
   - overwrites existing pair photo and sets new TTL
 
 - `GET /check_photo/{pairing_id}`
+  - query: `auth_token`
   - check for waiting photo after offline period
 
 - `WS /ws/pairing-code/{code}`
   - notifies creator when joiner matches
 
 - `WS /ws/pairing/{pairing_id}`
+  - query: `auth_token`
   - broadcasts `photo_uploaded` event instantly
 
 ## 3. Run Mobile App
@@ -94,15 +98,22 @@ npm run start
 3. User B enters same code and joins.
 4. Backend generates UUID `pairing_id` and sends it to B immediately.
 5. Backend notifies A over WebSocket (and A can poll `/pairing/status/{code}` fallback).
-6. Both clients save `pairing_id` in AsyncStorage so they remain paired without server-side permanent records.
+6. Both clients save `pairing_id` and `auth_token` in AsyncStorage so they remain paired without server-side permanent records.
 
 ## Photo Flow
 
-1. Any paired user uploads one image.
+1. Any paired user uploads one image with their signed `auth_token`.
 2. Backend stores image in Redis key `photo:{pairing_id}` with TTL.
 3. New upload overwrites the old one (same key) and resets TTL.
 4. Backend pushes `photo_uploaded` event to connected partner.
-5. Offline partner checks `/check_photo/{pairing_id}` when app opens.
+5. Offline partner checks `/check_photo/{pairing_id}?auth_token=...` when app opens.
+
+## Mobile Features Added
+
+- Camera capture and gallery picker for sending photos
+- TTL selector in app: `1h`, `6h`, `24h`, or custom (`1-168` hours)
+- Tap photo to open a larger full-screen viewer
+- Signed token guard in API client for upload/check/websocket
 
 ## Frontend 24-Hour Countdown
 
