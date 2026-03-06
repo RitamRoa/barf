@@ -483,14 +483,20 @@ export default function App() {
           </View>
 
           {photo ? (
-            <>
-              <Pressable onPress={() => setViewerVisible(true)}>
-                <Image source={{ uri: `data:${photo.mimeType};base64,${photo.imageB64}` }} style={styles.photo} />
-              </Pressable>
-              <Text style={styles.metaText}>from {photo.senderName}</Text>
-              <Text style={styles.timerText}>Expires in {formatRemaining(remainingSeconds)}</Text>
-              <Text style={styles.photoHint}>Tap photo to view larger</Text>
-            </>
+            <Pressable onPress={() => setViewerVisible(true)} style={styles.photoRow}>
+              <View style={styles.photoThumb}>
+                <Image source={{ uri: `data:${photo.mimeType};base64,${photo.imageB64}` }} style={styles.photoThumbImg} />
+                <View style={styles.photoThumbOverlay}>
+                  <Text style={styles.photoThumbIcon}>🔍</Text>
+                </View>
+              </View>
+              <View style={styles.photoInfo}>
+                <Text style={styles.photoInfoTitle}>Photo received</Text>
+                <Text style={styles.metaText}>from {photo.senderName}</Text>
+                <Text style={styles.timerText}>{formatRemaining(remainingSeconds)}</Text>
+                <Text style={styles.photoHint}>Tap to preview</Text>
+              </View>
+            </Pressable>
           ) : (
             <View style={styles.emptyState}>
               <Text style={styles.metaText}>No active photo right now.</Text>
@@ -716,12 +722,47 @@ const styles = StyleSheet.create({
     color: theme.colors.textSecondary,
     fontSize: 12
   },
-  photo: {
-    width: "100%",
-    aspectRatio: 1,
+  photoRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing.md,
+    backgroundColor: "#121212",
     borderRadius: theme.radius.lg,
     borderWidth: 1,
-    borderColor: theme.colors.border
+    borderColor: theme.colors.border,
+    padding: theme.spacing.sm
+  },
+  photoThumb: {
+    width: 64,
+    height: 64,
+    borderRadius: theme.radius.md,
+    overflow: "hidden",
+    position: "relative"
+  },
+  photoThumbImg: {
+    width: 64,
+    height: 64
+  },
+  photoThumbOverlay: {
+    position: "absolute",
+    bottom: 0,
+    right: 0,
+    backgroundColor: "rgba(0,0,0,0.55)",
+    borderTopLeftRadius: theme.radius.md,
+    paddingHorizontal: 4,
+    paddingVertical: 1
+  },
+  photoThumbIcon: {
+    fontSize: 13
+  },
+  photoInfo: {
+    flex: 1,
+    gap: 3
+  },
+  photoInfoTitle: {
+    color: theme.colors.textPrimary,
+    fontSize: 14,
+    fontWeight: "600"
   },
   timerText: {
     color: theme.colors.accent,

@@ -47,11 +47,17 @@ export async function uploadPhoto(params: {
   form.append("auth_token", params.authToken);
   form.append("ttl_hours", String(params.ttlHours));
 
-  form.append("image", {
-    uri: params.imageUri,
-    type: params.mimeType,
-    name: "photo.jpg"
-  } as any);
+  if (Platform.OS === "web") {
+    const blobRes = await fetch(params.imageUri);
+    const blob = await blobRes.blob();
+    form.append("image", blob, "photo.jpg");
+  } else {
+    form.append("image", {
+      uri: params.imageUri,
+      type: params.mimeType,
+      name: "photo.jpg"
+    } as any);
+  }
 
   const res = await fetch(`${API_BASE}/photo/upload`, {
     method: "POST",
