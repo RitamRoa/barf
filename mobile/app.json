@@ -1,0 +1,24 @@
+{
+  "expo": {
+    "name": "barf",
+    "slug": "barf",
+    "scheme": "barf",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#111111"
+      }
+    },
+    "plugins": [
+      "expo-image-picker"
+    ]
+  }
+}

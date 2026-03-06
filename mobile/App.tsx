@@ -1,0 +1,646 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  ActivityIndicator,
+  Alert,
+  Image,
+  Pressable,
+  SafeAreaView,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TextInput,
+  View
+} from "react-native";
+import * as ImagePicker from "expo-image-picker";
+
+import {
+  checkPairStatus,
+  checkPhoto,
+  createPairCode,
+  joinPairCode,
+  pairingCodeWsUrl,
+  pairingWsUrl,
+  uploadPhoto
+} from "./src/api";
+import { clearPairingState, getPairingState, savePairingState } from "./src/storage";
+import { theme } from "./src/theme";
+import type { PairingState, PhotoPayload } from "./src/types";
+
+type UiPhoto = {
+  senderName: string;
+  mimeType: string;
+  imageB64: string;
+  expiresAtMs: number;
+};
+
+function toUiPhoto(payload: PhotoPayload): UiPhoto {
+  return {
+    senderName: payload.sender_name,
+    mimeType: payload.mime_type,
+    imageB64: payload.image_b64,
+    expiresAtMs: Date.now() + payload.expires_in_seconds * 1000
+  };
+}
+
+function formatRemaining(totalSeconds: number): string {
+  const safe = Math.max(totalSeconds, 0);
+  const h = Math.floor(safe / 3600)
+    .toString()
+    .padStart(2, "0");
+  const m = Math.floor((safe % 3600) / 60)
+    .toString()
+    .padStart(2, "0");
+  const s = Math.floor(safe % 60)
+    .toString()
+    .padStart(2, "0");
+  return `${h}:${m}:${s}`;
+}
+
+export default function App() {
+  const [loading, setLoading] = useState(true);
+  const [pairing, setPairing] = useState<PairingState | null>(null);
+
+  const [mode, setMode] = useState<"create" | "join">("create");
+  const [nameInput, setNameInput] = useState("");
+  const [joinCodeInput, setJoinCodeInput] = useState("");
+  const [generatedCode, setGeneratedCode] = useState<string | null>(null);
+  const [pairingError, setPairingError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const [photo, setPhoto] = useState<UiPhoto | null>(null);
+  const [clock, setClock] = useState(Date.now());
+
+  const pairCodeWsRef = useRef<WebSocket | null>(null);
+  const pairWsRef = useRef<WebSocket | null>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const photoPollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wsRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const bootstrap = async () => {
+      const stored = await getPairingState();
+      if (stored) {
+        setPairing(stored);
+      }
+      setLoading(false);
+    };
+
+    bootstrap().catch(() => setLoading(false));
+
+    return () => {
+      pairCodeWsRef.current?.close();
+      pairWsRef.current?.close();
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+      if (photoPollTimerRef.current) clearInterval(photoPollTimerRef.current);
+      if (wsRetryTimerRef.current) clearTimeout(wsRetryTimerRef.current);
+    };
+  }, []);
+
+  const refreshLatestPhoto = async (pairingId: string) => {
+    try {
+      const res = await checkPhoto(pairingId);
+      if (res.has_photo) {
+        setPhoto(toUiPhoto(res));
+      } else {
+        setPhoto(null);
+      }
+    } catch {
+      // Silent failure for background refresh calls.
+    }
+  };
+
+  useEffect(() => {
+    if (!pairing) return;
+
+    let cancelled = false;
+    let retries = 0;
+
+    const connectPairingWs = () => {
+      if (cancelled) return;
+
+      const ws = new WebSocket(pairingWsUrl(pairing.pairingId));
+      pairWsRef.current = ws;
+
+      ws.onopen = () => {
+        retries = 0;
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.event === "photo_uploaded") {
+            setPhoto(toUiPhoto(payload as PhotoPayload));
+          }
+        } catch {
+          // Ignore malformed messages.
+        }
+      };
+
+      ws.onclose = () => {
+        if (cancelled) return;
+        const retryDelayMs = Math.min(1000 * Math.pow(2, retries), 15000);
+        retries += 1;
+        if (wsRetryTimerRef.current) clearTimeout(wsRetryTimerRef.current);
+        wsRetryTimerRef.current = setTimeout(connectPairingWs, retryDelayMs);
+      };
+    };
+
+    void refreshLatestPhoto(pairing.pairingId);
+    connectPairingWs();
+
+    if (photoPollTimerRef.current) clearInterval(photoPollTimerRef.current);
+    photoPollTimerRef.current = setInterval(() => {
+      void refreshLatestPhoto(pairing.pairingId);
+    }, 15000);
+
+    return () => {
+      cancelled = true;
+      pairWsRef.current?.close();
+      pairWsRef.current = null;
+      if (photoPollTimerRef.current) {
+        clearInterval(photoPollTimerRef.current);
+        photoPollTimerRef.current = null;
+      }
+      if (wsRetryTimerRef.current) {
+        clearTimeout(wsRetryTimerRef.current);
+        wsRetryTimerRef.current = null;
+      }
+    };
+  }, [pairing]);
+
+  useEffect(() => {
+    const id = setInterval(() => setClock(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const remainingSeconds = useMemo(() => {
+    if (!photo) return 0;
+    return Math.max(0, Math.floor((photo.expiresAtMs - clock) / 1000));
+  }, [photo, clock]);
+
+  useEffect(() => {
+    if (photo && remainingSeconds <= 0) {
+      setPhoto(null);
+    }
+  }, [photo, remainingSeconds]);
+
+  const finalizePairing = async (state: PairingState) => {
+    await savePairingState(state);
+    setPairing(state);
+    setGeneratedCode(null);
+    setPairingError(null);
+
+    pairCodeWsRef.current?.close();
+    pairCodeWsRef.current = null;
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+  };
+
+  const startCreateCode = async () => {
+    const cleanName = nameInput.trim();
+    if (!cleanName) {
+      setPairingError("Enter your name first.");
+      return;
+    }
+
+    try {
+      setBusy(true);
+      setPairingError(null);
+
+      const data = await createPairCode(cleanName);
+      setGeneratedCode(data.code);
+
+      const ws = new WebSocket(pairingCodeWsUrl(data.code));
+      pairCodeWsRef.current = ws;
+
+      ws.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.event === "pairing_matched") {
+            finalizePairing({
+              pairingId: payload.pairing_id,
+              userName: cleanName,
+              partnerName: payload.partner_name
+            }).catch(() => {});
+          }
+        } catch {
+          // Ignore malformed messages.
+        }
+      };
+
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+      pollTimerRef.current = setInterval(async () => {
+        try {
+          const status = await checkPairStatus(data.code);
+          if (status.matched && status.pairing_id) {
+            await finalizePairing({
+              pairingId: status.pairing_id,
+              userName: cleanName,
+              partnerName: status.partner_name
+            });
+          }
+          if (status.expired) {
+            setPairingError("Code expired. Create a new one.");
+            setGeneratedCode(null);
+          }
+        } catch {
+          // Keep waiting silently.
+        }
+      }, 5000);
+    } catch {
+      setPairingError("Could not generate code.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const startJoinCode = async () => {
+    const cleanName = nameInput.trim();
+    const cleanCode = joinCodeInput.trim();
+
+    if (!cleanName || cleanCode.length !== 6) {
+      setPairingError("Add your name and a valid 6-digit code.");
+      return;
+    }
+
+    try {
+      setBusy(true);
+      setPairingError(null);
+
+      const data = await joinPairCode(cleanName, cleanCode);
+      await finalizePairing({
+        pairingId: data.pairing_id,
+        userName: cleanName,
+        partnerName: data.partner_name
+      });
+    } catch {
+      setPairingError("That code is invalid or expired.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const pickAndSendPhoto = async () => {
+    if (!pairing) return;
+
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert("Permission needed", "Allow photo library access to share pictures.");
+      return;
+    }
+
+    const selected = await ImagePicker.launchImageLibraryAsync({
+      allowsEditing: true,
+      quality: 0.85,
+      mediaTypes: ["images"]
+    });
+
+    if (selected.canceled || selected.assets.length === 0) return;
+
+    const asset = selected.assets[0];
+    const mimeType = asset.mimeType ?? "image/jpeg";
+
+    try {
+      setBusy(true);
+      await uploadPhoto({
+        pairingId: pairing.pairingId,
+        senderName: pairing.userName,
+        imageUri: asset.uri,
+        mimeType,
+        ttlHours: 24
+      });
+
+      // Pull the saved object so sender and receiver see exactly the same data.
+      const latest = await checkPhoto(pairing.pairingId);
+      if (latest.has_photo) {
+        setPhoto(toUiPhoto(latest));
+      }
+    } catch {
+      Alert.alert("Upload failed", "Please try again.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resetPairing = async () => {
+    await clearPairingState();
+    setPairing(null);
+    setPhoto(null);
+    setGeneratedCode(null);
+    setJoinCodeInput("");
+  };
+
+  if (loading) {
+    return (
+      <SafeAreaView style={styles.centeredScreen}>
+        <StatusBar barStyle="light-content" />
+        <ActivityIndicator color={theme.colors.accent} size="large" />
+      </SafeAreaView>
+    );
+  }
+
+  if (!pairing) {
+    return (
+      <SafeAreaView style={styles.screen}>
+        <StatusBar barStyle="light-content" />
+        <View style={styles.blobA} />
+        <View style={styles.blobB} />
+
+        <ScrollView contentContainerStyle={styles.authWrap} keyboardShouldPersistTaps="handled">
+          <Text style={styles.eyebrow}>barf</Text>
+          <Text style={styles.title}>Quiet Pair</Text>
+          <Text style={styles.subtitle}>One private photo, always temporary.</Text>
+
+          <View style={styles.modeRow}>
+            <Pressable onPress={() => setMode("create")} style={[styles.modeBtn, mode === "create" && styles.modeBtnActive]}>
+              <Text style={[styles.modeText, mode === "create" && styles.modeTextActive]}>Create</Text>
+            </Pressable>
+            <Pressable onPress={() => setMode("join")} style={[styles.modeBtn, mode === "join" && styles.modeBtnActive]}>
+              <Text style={[styles.modeText, mode === "join" && styles.modeTextActive]}>Join</Text>
+            </Pressable>
+          </View>
+
+          <View style={styles.panel}>
+            <TextInput
+              value={nameInput}
+              onChangeText={setNameInput}
+              placeholder="Your name"
+              placeholderTextColor={theme.colors.textSecondary}
+              style={styles.input}
+              autoCapitalize="words"
+            />
+
+            {mode === "join" ? (
+              <TextInput
+                value={joinCodeInput}
+                onChangeText={(v: string) => setJoinCodeInput(v.replace(/[^0-9]/g, "").slice(0, 6))}
+                placeholder="6-digit code"
+                placeholderTextColor={theme.colors.textSecondary}
+                style={styles.input}
+                keyboardType="number-pad"
+              />
+            ) : null}
+
+            {mode === "create" && generatedCode ? (
+              <View style={styles.codeCard}>
+                <Text style={styles.codeLabel}>Share this code</Text>
+                <Text style={styles.codeValue}>{generatedCode}</Text>
+                <Text style={styles.codeHint}>Waiting for your partner to join...</Text>
+              </View>
+            ) : null}
+
+            {pairingError ? <Text style={styles.errorText}>{pairingError}</Text> : null}
+
+            <Pressable
+              onPress={mode === "create" ? startCreateCode : startJoinCode}
+              style={[styles.primaryButton, busy && styles.buttonDisabled]}
+              disabled={busy}
+            >
+              <Text style={styles.primaryButtonText}>{mode === "create" ? "Generate code" : "Match now"}</Text>
+            </Pressable>
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  return (
+    <SafeAreaView style={styles.screen}>
+      <StatusBar barStyle="light-content" />
+      <View style={styles.blobA} />
+      <View style={styles.blobB} />
+
+      <ScrollView contentContainerStyle={styles.homeWrap}>
+        <Text style={styles.eyebrow}>paired</Text>
+        <Text style={styles.title}>Photo Loop</Text>
+        <Text style={styles.subtitle}>You are connected as {pairing.userName}.</Text>
+
+        <View style={styles.panel}>
+          <View style={styles.headerRow}>
+            <Text style={styles.sectionTitle}>Shared Photo</Text>
+            <Text style={styles.metaText}>ID {pairing.pairingId.slice(0, 8)}</Text>
+          </View>
+
+          {photo ? (
+            <>
+              <Image source={{ uri: `data:${photo.mimeType};base64,${photo.imageB64}` }} style={styles.photo} />
+              <Text style={styles.metaText}>from {photo.senderName}</Text>
+              <Text style={styles.timerText}>Expires in {formatRemaining(remainingSeconds)}</Text>
+            </>
+          ) : (
+            <View style={styles.emptyState}>
+              <Text style={styles.metaText}>No active photo right now.</Text>
+            </View>
+          )}
+
+          <Pressable onPress={pickAndSendPhoto} style={[styles.primaryButton, busy && styles.buttonDisabled]} disabled={busy}>
+            <Text style={styles.primaryButtonText}>Send New Photo</Text>
+          </Pressable>
+
+          <Pressable onPress={resetPairing} style={styles.ghostButton}>
+            <Text style={styles.ghostButtonText}>Reset local pairing</Text>
+          </Pressable>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  screen: {
+    flex: 1,
+    backgroundColor: theme.colors.background
+  },
+  centeredScreen: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: theme.colors.background
+  },
+  blobA: {
+    position: "absolute",
+    top: -50,
+    right: -30,
+    width: 180,
+    height: 180,
+    borderRadius: 90,
+    backgroundColor: "#241F17"
+  },
+  blobB: {
+    position: "absolute",
+    bottom: 90,
+    left: -80,
+    width: 220,
+    height: 220,
+    borderRadius: 110,
+    backgroundColor: "#17130F"
+  },
+  authWrap: {
+    padding: theme.spacing.xl,
+    paddingTop: 42,
+    gap: theme.spacing.md
+  },
+  homeWrap: {
+    padding: theme.spacing.xl,
+    paddingTop: 42,
+    gap: theme.spacing.md,
+    paddingBottom: 30
+  },
+  eyebrow: {
+    color: theme.colors.accent,
+    letterSpacing: 2,
+    textTransform: "uppercase",
+    fontSize: 12
+  },
+  title: {
+    color: theme.colors.textPrimary,
+    fontSize: 50,
+    lineHeight: 52,
+    fontFamily: "serif"
+  },
+  subtitle: {
+    color: theme.colors.textSecondary,
+    fontSize: 15,
+    lineHeight: 22,
+    maxWidth: 300
+  },
+  modeRow: {
+    flexDirection: "row",
+    backgroundColor: theme.colors.panelSoft,
+    borderRadius: 999,
+    padding: 4,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    marginTop: theme.spacing.sm,
+    marginBottom: theme.spacing.sm
+  },
+  modeBtn: {
+    flex: 1,
+    borderRadius: 999,
+    paddingVertical: 10,
+    alignItems: "center"
+  },
+  modeBtnActive: {
+    backgroundColor: theme.colors.accent
+  },
+  modeText: {
+    color: theme.colors.textSecondary,
+    fontWeight: "600"
+  },
+  modeTextActive: {
+    color: "#1B1A17"
+  },
+  panel: {
+    backgroundColor: theme.colors.panel,
+    borderRadius: theme.radius.xl,
+    padding: theme.spacing.lg,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    gap: theme.spacing.md
+  },
+  input: {
+    backgroundColor: "#1F1F1F",
+    color: theme.colors.textPrimary,
+    borderRadius: theme.radius.md,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    fontSize: 15
+  },
+  codeCard: {
+    backgroundColor: "#121212",
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: theme.radius.lg,
+    padding: theme.spacing.lg,
+    alignItems: "center",
+    gap: theme.spacing.xs
+  },
+  codeLabel: {
+    color: theme.colors.textSecondary,
+    fontSize: 13,
+    textTransform: "uppercase",
+    letterSpacing: 1.4
+  },
+  codeValue: {
+    color: theme.colors.accent,
+    fontSize: 42,
+    lineHeight: 44,
+    fontFamily: "serif",
+    letterSpacing: 2
+  },
+  codeHint: {
+    color: theme.colors.textSecondary,
+    fontSize: 12
+  },
+  errorText: {
+    color: "#FFA6A6"
+  },
+  primaryButton: {
+    backgroundColor: theme.colors.button,
+    borderRadius: 999,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 14
+  },
+  buttonDisabled: {
+    opacity: 0.5
+  },
+  primaryButtonText: {
+    color: theme.colors.buttonText,
+    fontWeight: "700",
+    fontSize: 15
+  },
+  headerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between"
+  },
+  sectionTitle: {
+    color: theme.colors.textPrimary,
+    fontSize: 28,
+    fontFamily: "serif"
+  },
+  metaText: {
+    color: theme.colors.textSecondary,
+    fontSize: 12
+  },
+  photo: {
+    width: "100%",
+    aspectRatio: 1,
+    borderRadius: theme.radius.lg,
+    borderWidth: 1,
+    borderColor: theme.colors.border
+  },
+  timerText: {
+    color: theme.colors.accent,
+    fontSize: 16,
+    fontWeight: "700"
+  },
+  emptyState: {
+    borderRadius: theme.radius.lg,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: "#121212",
+    alignItems: "center",
+    justifyContent: "center",
+    minHeight: 160
+  },
+  ghostButton: {
+    borderRadius: 999,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 12,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: "#111111"
+  },
+  ghostButtonText: {
+    color: theme.colors.textSecondary,
+    fontSize: 13
+  }
+});
