@@ -25,6 +25,12 @@ class CreateCodeRequest(BaseModel):
     name: str = Field(min_length=1, max_length=40)
 
 
+class MarkSeenRequest(BaseModel):
+    pairing_id: str
+    auth_token: str
+    photo_id: str
+
+
 class JoinCodeRequest(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     code: str = Field(pattern=r"^\d{6}$")
@@ -96,8 +102,8 @@ def pairing_result_key(code: str) -> str:
     return f"pairing:result:{code}"
 
 
-def photo_key(pairing_id: str) -> str:
-    return f"photo:{pairing_id}"
+def photo_queue_key(pairing_id: str) -> str:
+    return f"photo_queue:{pairing_id}"
 
 
 def _token_signature(payload_b64: str) -> str:
@@ -267,23 +273,48 @@ async def upload_photo(
         raise HTTPException(status_code=413, detail="Image exceeds max allowed size")
 
     encoded = base64.b64encode(raw_image).decode("ascii")
+
+    r: redis.Redis = app.state.redis
+    queue_key = photo_queue_key(pairing_id)
+
+    # Block sender if they already have 2 unseen photos queued
+    now_ts = datetime.now(UTC).timestamp()
+    raw_items = await r.lrange(queue_key, 0, -1)
+    sender_unseen = [
+        item for item in raw_items
+        if json.loads(item).get("sender_name") == sender_name
+        and json.loads(item).get("expires_at", 0) > now_ts
+    ]
+    if len(sender_unseen) >= 2:
+        raise HTTPException(
+            status_code=429,
+            detail="Partner hasn't seen your 2 queued photos yet.",
+        )
+
+    photo_id = str(uuid4())
+    expires_at = now_ts + ttl_seconds
     payload = {
+        "photo_id": photo_id,
         "pairing_id": pairing_id,
-        "sender_name": sender_name.strip(),
+        "sender_name": sender_name,
         "mime_type": image.content_type,
         "image_b64": encoded,
         "created_at": utc_now_iso(),
+        "expires_at": expires_at,
     }
 
-    r: redis.Redis = app.state.redis
-    await r.set(photo_key(pairing_id), json.dumps(payload), ex=ttl_seconds)
+    await r.rpush(queue_key, json.dumps(payload))
+    current_ttl = await r.ttl(queue_key)
+    new_ttl = ttl_seconds if current_ttl <= 0 else max(current_ttl, ttl_seconds)
+    await r.expire(queue_key, new_ttl + 60)
 
     await hub.broadcast(
         room=f"pairing:{pairing_id}",
         payload={
             "event": "photo_uploaded",
+            "photo_id": photo_id,
             "pairing_id": pairing_id,
-            "sender_name": sender_name.strip(),
+            "sender_name": sender_name,
             "mime_type": image.content_type,
             "image_b64": encoded,
             "expires_in_seconds": ttl_seconds,
@@ -300,22 +331,56 @@ async def check_photo(pairing_id: str, auth_token: str) -> dict[str, Any]:
     if token_payload["pairing_id"] != pairing_id:
         raise HTTPException(status_code=403, detail="Token does not match pairing")
 
+    requester_name = str(token_payload["user_name"])
     r: redis.Redis = app.state.redis
-    raw = await r.get(photo_key(pairing_id))
-    if not raw:
+    queue_key = photo_queue_key(pairing_id)
+    raw_items = await r.lrange(queue_key, 0, -1)
+    now_ts = datetime.now(UTC).timestamp()
+
+    pending = [
+        json.loads(raw) for raw in raw_items
+        if json.loads(raw).get("sender_name") != requester_name
+        and json.loads(raw).get("expires_at", 0) > now_ts
+    ]
+
+    if not pending:
         return {"has_photo": False}
 
-    ttl = await r.ttl(photo_key(pairing_id))
-    payload = json.loads(raw)
+    first = pending[0]
+    remaining = int(first["expires_at"] - now_ts)
     return {
         "has_photo": True,
+        "photo_id": first["photo_id"],
         "pairing_id": pairing_id,
-        "sender_name": payload["sender_name"],
-        "mime_type": payload["mime_type"],
-        "image_b64": payload["image_b64"],
-        "created_at": payload["created_at"],
-        "expires_in_seconds": max(ttl, 0),
+        "sender_name": first["sender_name"],
+        "mime_type": first["mime_type"],
+        "image_b64": first["image_b64"],
+        "created_at": first["created_at"],
+        "expires_in_seconds": max(remaining, 0),
+        "queued_count": len(pending),
     }
+
+
+@app.post("/photo/mark-seen")
+async def mark_photo_seen(body: MarkSeenRequest) -> dict[str, Any]:
+    token_payload = verify_pairing_token(body.auth_token)
+    if token_payload["pairing_id"] != body.pairing_id:
+        raise HTTPException(status_code=403, detail="Token does not match pairing")
+
+    requester_name = str(token_payload["user_name"])
+    r: redis.Redis = app.state.redis
+    queue_key = photo_queue_key(body.pairing_id)
+    raw_items = await r.lrange(queue_key, 0, -1)
+
+    for raw in raw_items:
+        item = json.loads(raw)
+        if item.get("photo_id") == body.photo_id.strip():
+            if item.get("sender_name") == requester_name:
+                raise HTTPException(status_code=403, detail="Cannot mark your own photo as seen")
+            await r.lrem(queue_key, 1, raw)
+            return {"success": True}
+
+    return {"success": False}
 
 
 @app.websocket("/ws/pairing-code/{code}")

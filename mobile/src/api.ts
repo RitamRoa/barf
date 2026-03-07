@@ -1,11 +1,26 @@
+import Constants from "expo-constants";
 import { Platform } from "react-native";
 
 import type { PhotoPayload } from "./types";
 
-// Prefer explicit env override. Fallback avoids localhost IPv6 websocket issues on some browsers.
-const runtimeHost = Platform.OS === "web" && typeof window !== "undefined" ? window.location.hostname : "127.0.0.1";
-const fallbackHost = runtimeHost === "localhost" ? "127.0.0.1" : runtimeHost;
-export const API_BASE = process.env.EXPO_PUBLIC_API_BASE ?? `http://${fallbackHost}:8000`;
+// Derive the backend host so every platform (web, Expo Go on phone) reaches the same server.
+function getApiHost(): string {
+  if (Platform.OS === "web" && typeof window !== "undefined") {
+    const h = window.location.hostname;
+    // Avoid IPv6 / "localhost" WebSocket issues in some browsers
+    return h === "localhost" ? "127.0.0.1" : h;
+  }
+  // On native (Expo Go) the Metro bundler host == the laptop's LAN IP.
+  // hostUri looks like "192.168.x.x:8081"; debuggerHost is the legacy field.
+  const hostUri: string =
+    (Constants.expoConfig?.hostUri as string | undefined) ??
+    (Constants.manifest2?.extra?.expoClient?.hostUri as string | undefined) ??
+    "";
+  const nativeHost = hostUri.split(":")[0];
+  return nativeHost || "127.0.0.1";
+}
+
+export const API_BASE = process.env.EXPO_PUBLIC_API_BASE ?? `http://${getApiHost()}:8000`;
 
 export async function createPairCode(name: string): Promise<{ code: string; expires_in_seconds: number }> {
   const res = await fetch(`${API_BASE}/pairing/create-code`, {
@@ -64,8 +79,26 @@ export async function uploadPhoto(params: {
     body: form
   });
 
-  if (!res.ok) throw new Error("Upload failed");
+  if (!res.ok) {
+    const detail = res.status === 429
+      ? "Partner hasn't seen your 2 queued photos yet."
+      : "Upload failed";
+    throw new Error(detail);
+  }
   return res.json();
+}
+
+export async function markPhotoSeen(
+  pairingId: string,
+  authToken: string,
+  photoId: string
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/photo/mark-seen`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pairing_id: pairingId, auth_token: authToken, photo_id: photoId })
+  });
+  if (!res.ok) throw new Error(`mark-seen failed: ${res.status}`);
 }
 
 export async function checkPhoto(

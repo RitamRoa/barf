@@ -20,6 +20,7 @@ import {
   checkPhoto,
   createPairCode,
   joinPairCode,
+  markPhotoSeen,
   pairingCodeWsUrl,
   pairingWsUrl,
   uploadPhoto
@@ -29,6 +30,7 @@ import { theme } from "./src/theme";
 import type { PairingState, PhotoPayload } from "./src/types";
 
 type UiPhoto = {
+  photoId: string;
   senderName: string;
   mimeType: string;
   imageB64: string;
@@ -37,6 +39,7 @@ type UiPhoto = {
 
 function toUiPhoto(payload: PhotoPayload): UiPhoto {
   return {
+    photoId: payload.photo_id,
     senderName: payload.sender_name,
     mimeType: payload.mime_type,
     imageB64: payload.image_b64,
@@ -46,16 +49,17 @@ function toUiPhoto(payload: PhotoPayload): UiPhoto {
 
 function formatRemaining(totalSeconds: number): string {
   const safe = Math.max(totalSeconds, 0);
-  const h = Math.floor(safe / 3600)
-    .toString()
-    .padStart(2, "0");
-  const m = Math.floor((safe % 3600) / 60)
-    .toString()
-    .padStart(2, "0");
-  const s = Math.floor(safe % 60)
-    .toString()
-    .padStart(2, "0");
-  return `${h}:${m}:${s}`;
+  if (safe < 60) return "less than a minute left";
+  if (safe < 3600) {
+    const m = Math.round(safe / 60);
+    return `${m} minute${m !== 1 ? "s" : ""} left`;
+  }
+  if (safe < 86400) {
+    const h = Math.floor(safe / 3600);
+    return `${h} hour${h !== 1 ? "s" : ""} left`;
+  }
+  const d = Math.floor(safe / 86400);
+  return `${d} day${d !== 1 ? "s" : ""} left`;
 }
 
 export default function App() {
@@ -69,7 +73,7 @@ export default function App() {
   const [pairingError, setPairingError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const [photo, setPhoto] = useState<UiPhoto | null>(null);
+  const [photos, setPhotos] = useState<UiPhoto[]>([]);
   const [clock, setClock] = useState(Date.now());
   const [ttlPreset, setTtlPreset] = useState<"1h" | "6h" | "24h" | "custom">("24h");
   const [customHoursInput, setCustomHoursInput] = useState("48");
@@ -81,6 +85,7 @@ export default function App() {
   const photoPollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const wsRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pairingResolvedRef = useRef(false);
+  const dismissedPhotoIds = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     const bootstrap = async () => {
@@ -109,10 +114,14 @@ export default function App() {
   const refreshLatestPhoto = async (state: PairingState) => {
     try {
       const res = await checkPhoto(state.pairingId, state.authToken);
-      if (res.has_photo) {
-        setPhoto(toUiPhoto(res));
-      } else {
-        setPhoto(null);
+      if (res.has_photo && !dismissedPhotoIds.current.has(res.photo_id)) {
+        const incoming = toUiPhoto(res);
+        setPhotos(prev => {
+          if (prev.some(p => p.photoId === incoming.photoId)) return prev;
+          return [incoming, ...prev.filter(p => p.photoId !== incoming.photoId)].slice(0, 2);
+        });
+      } else if (!res.has_photo) {
+        setPhotos([]);
       }
     } catch {
       // Silent failure for background refresh calls.
@@ -138,8 +147,14 @@ export default function App() {
       ws.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data);
-          if (payload.event === "photo_uploaded") {
-            setPhoto(toUiPhoto(payload as PhotoPayload));
+          if (payload.event === "photo_uploaded" && payload.sender_name !== pairing.userName) {
+            const incoming = toUiPhoto(payload as PhotoPayload);
+            if (dismissedPhotoIds.current.has(incoming.photoId)) return;
+            setPhotos(prev => {
+              if (prev.some(p => p.photoId === incoming.photoId)) return prev;
+              if (prev.length >= 2) return prev;
+              return [...prev, incoming];
+            });
           }
         } catch {
           // Ignore malformed messages.
@@ -188,15 +203,15 @@ export default function App() {
   }, []);
 
   const remainingSeconds = useMemo(() => {
-    if (!photo) return 0;
-    return Math.max(0, Math.floor((photo.expiresAtMs - clock) / 1000));
-  }, [photo, clock]);
+    if (photos.length === 0) return 0;
+    return Math.max(0, Math.floor((photos[0].expiresAtMs - clock) / 1000));
+  }, [photos, clock]);
 
   useEffect(() => {
-    if (photo && remainingSeconds <= 0) {
-      setPhoto(null);
+    if (photos.length > 0 && remainingSeconds <= 0) {
+      setPhotos(prev => prev.slice(1));
     }
-  }, [photo, remainingSeconds]);
+  }, [photos, remainingSeconds]);
 
   const finalizePairing = async (state: PairingState) => {
     if (pairingResolvedRef.current) return;
@@ -370,23 +385,33 @@ export default function App() {
         mimeType,
         ttlHours
       });
-
-      // Pull the saved object so sender and receiver see exactly the same data.
-      const latest = await checkPhoto(pairing.pairingId, pairing.authToken);
-      if (latest.has_photo) {
-        setPhoto(toUiPhoto(latest));
-      }
-    } catch {
-      Alert.alert("Upload failed", "Please try again.");
+    } catch (err: any) {
+      Alert.alert("Cannot send", err?.message ?? "Upload failed. Please try again.");
     } finally {
       setBusy(false);
+    }
+  };
+
+  const dismissViewer = async () => {
+    setViewerVisible(false);
+    if (photos.length === 0 || !pairing) return;
+    const current = photos[0];
+    // Register as dismissed immediately — before any async work — so polls
+    // and WS replays cannot re-add this photo while mark-seen is in flight.
+    dismissedPhotoIds.current.add(current.photoId);
+    setPhotos(prev => prev.slice(1));
+    try {
+      await markPhotoSeen(pairing.pairingId, pairing.authToken, current.photoId);
+      await refreshLatestPhoto(pairing);
+    } catch {
+      // Best-effort; local state already updated.
     }
   };
 
   const resetPairing = async () => {
     await clearPairingState();
     setPairing(null);
-    setPhoto(null);
+    setPhotos([]);
     setGeneratedCode(null);
     setJoinCodeInput("");
   };
@@ -482,19 +507,20 @@ export default function App() {
             <Text style={styles.metaText}>ID {pairing.pairingId.slice(0, 8)}</Text>
           </View>
 
-          {photo ? (
+          {photos.length > 0 ? (
             <Pressable onPress={() => setViewerVisible(true)} style={styles.photoRow}>
               <View style={styles.photoThumb}>
-                <Image source={{ uri: `data:${photo.mimeType};base64,${photo.imageB64}` }} style={styles.photoThumbImg} />
+                <Image source={{ uri: `data:${photos[0].mimeType};base64,${photos[0].imageB64}` }} style={styles.photoThumbImg} />
                 <View style={styles.photoThumbOverlay}>
                   <Text style={styles.photoThumbIcon}>🔍</Text>
                 </View>
               </View>
               <View style={styles.photoInfo}>
                 <Text style={styles.photoInfoTitle}>Photo received</Text>
-                <Text style={styles.metaText}>from {photo.senderName}</Text>
+                <Text style={styles.metaText}>from {photos[0].senderName}</Text>
                 <Text style={styles.timerText}>{formatRemaining(remainingSeconds)}</Text>
-                <Text style={styles.photoHint}>Tap to preview</Text>
+                {photos.length > 1 ? <Text style={styles.metaText}>+{photos.length - 1} more queued</Text> : null}
+                <Text style={styles.photoHint}>Tap to view once</Text>
               </View>
             </Pressable>
           ) : (
@@ -550,12 +576,12 @@ export default function App() {
         </View>
       </ScrollView>
 
-      <Modal visible={viewerVisible} transparent animationType="fade" onRequestClose={() => setViewerVisible(false)}>
+      <Modal visible={viewerVisible} transparent animationType="fade" onRequestClose={() => { void dismissViewer(); }}>
         <View style={styles.viewerBackdrop}>
-          <Pressable style={styles.viewerDismiss} onPress={() => setViewerVisible(false)}>
+          <Pressable style={styles.viewerDismiss} onPress={() => { void dismissViewer(); }}>
             <Text style={styles.viewerDismissText}>Close</Text>
           </Pressable>
-          {photo ? <Image source={{ uri: `data:${photo.mimeType};base64,${photo.imageB64}` }} style={styles.viewerImage} /> : null}
+          {photos[0] ? <Image source={{ uri: `data:${photos[0].mimeType};base64,${photos[0].imageB64}` }} style={styles.viewerImage} /> : null}
         </View>
       </Modal>
     </SafeAreaView>

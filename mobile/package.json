@@ -13,6 +13,7 @@
     "@expo/metro-runtime": "~5.0.5",
     "@react-native-async-storage/async-storage": "1.23.1",
     "expo": "~53.0.3",
+    "expo-constants": "~17.1.8",
     "expo-image-picker": "~16.0.6",
     "react": "19.0.0",
     "react-dom": "19.0.0",
