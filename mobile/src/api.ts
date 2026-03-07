@@ -54,9 +54,33 @@ export async function uploadPhoto(params: {
   pairingId: string;
   authToken: string;
   imageUri: string;
+  imageB64?: string | null;
   mimeType: string;
   ttlHours: number;
 }): Promise<{ pairing_id: string; expires_in_seconds: number }> {
+  // On native, use JSON + base64 to avoid React Native FormData/URI reliability issues.
+  if (params.imageB64) {
+    const res = await fetch(`${API_BASE}/photo/upload-b64`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        pairing_id: params.pairingId,
+        auth_token: params.authToken,
+        ttl_hours: params.ttlHours,
+        mime_type: params.mimeType,
+        image_b64: params.imageB64
+      })
+    });
+    if (!res.ok) {
+      const detail = res.status === 429
+        ? "Partner hasn't seen your 2 queued photos yet."
+        : "Upload failed";
+      throw new Error(detail);
+    }
+    return res.json();
+  }
+
+  // Web: multipart FormData
   const form = new FormData();
   form.append("pairing_id", params.pairingId);
   form.append("auth_token", params.authToken);
@@ -67,6 +91,7 @@ export async function uploadPhoto(params: {
     const blob = await blobRes.blob();
     form.append("image", blob, "photo.jpg");
   } else {
+    // Fallback multipart path (web only reaches here now)
     form.append("image", {
       uri: params.imageUri,
       type: params.mimeType,

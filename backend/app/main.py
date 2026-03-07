@@ -31,6 +31,14 @@ class MarkSeenRequest(BaseModel):
     photo_id: str
 
 
+class UploadB64Request(BaseModel):
+    pairing_id: str
+    auth_token: str
+    ttl_hours: int = 24
+    mime_type: str = "image/jpeg"
+    image_b64: str
+
+
 class JoinCodeRequest(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     code: str = Field(pattern=r"^\d{6}$")
@@ -248,36 +256,16 @@ async def pairing_status(code: str) -> dict[str, Any]:
     return {"matched": False, "expired": True}
 
 
-@app.post("/photo/upload", response_model=UploadResponse)
-async def upload_photo(
-    pairing_id: str = Form(...),
-    auth_token: str = Form(...),
-    ttl_hours: int = Form(24),
-    image: UploadFile = File(...),
+async def _queue_photo(
+    *,
+    r: "redis.Redis",
+    pairing_id: str,
+    sender_name: str,
+    mime_type: str,
+    image_b64: str,
+    ttl_seconds: int,
 ) -> UploadResponse:
-    if ttl_hours < 1:
-        raise HTTPException(status_code=400, detail="ttl_hours must be >= 1")
-
-    ttl_seconds = min(ttl_hours * 3600, MAX_PHOTO_TTL_SECONDS)
-
-    if not image.content_type or not image.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Only image uploads are allowed")
-
-    token_payload = verify_pairing_token(auth_token)
-    if token_payload["pairing_id"] != pairing_id:
-        raise HTTPException(status_code=403, detail="Token does not match pairing")
-    sender_name = str(token_payload["user_name"]).strip()
-
-    raw_image = await image.read()
-    if len(raw_image) > settings.max_upload_size_bytes:
-        raise HTTPException(status_code=413, detail="Image exceeds max allowed size")
-
-    encoded = base64.b64encode(raw_image).decode("ascii")
-
-    r: redis.Redis = app.state.redis
     queue_key = photo_queue_key(pairing_id)
-
-    # Block sender if they already have 2 unseen photos queued
     now_ts = datetime.now(UTC).timestamp()
     raw_items = await r.lrange(queue_key, 0, -1)
     sender_unseen = [
@@ -297,8 +285,8 @@ async def upload_photo(
         "photo_id": photo_id,
         "pairing_id": pairing_id,
         "sender_name": sender_name,
-        "mime_type": image.content_type,
-        "image_b64": encoded,
+        "mime_type": mime_type,
+        "image_b64": image_b64,
         "created_at": utc_now_iso(),
         "expires_at": expires_at,
     }
@@ -315,14 +303,81 @@ async def upload_photo(
             "photo_id": photo_id,
             "pairing_id": pairing_id,
             "sender_name": sender_name,
-            "mime_type": image.content_type,
-            "image_b64": encoded,
+            "mime_type": mime_type,
+            "image_b64": image_b64,
             "expires_in_seconds": ttl_seconds,
             "created_at": payload["created_at"],
         },
     )
 
     return UploadResponse(pairing_id=pairing_id, expires_in_seconds=ttl_seconds)
+
+
+@app.post("/photo/upload", response_model=UploadResponse)
+async def upload_photo(
+    pairing_id: str = Form(...),
+    auth_token: str = Form(...),
+    ttl_hours: int = Form(24),
+    image: UploadFile = File(...),
+) -> UploadResponse:
+    if ttl_hours < 1:
+        raise HTTPException(status_code=400, detail="ttl_hours must be >= 1")
+    ttl_seconds = min(ttl_hours * 3600, MAX_PHOTO_TTL_SECONDS)
+
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are allowed")
+
+    token_payload = verify_pairing_token(auth_token)
+    if token_payload["pairing_id"] != pairing_id:
+        raise HTTPException(status_code=403, detail="Token does not match pairing")
+    sender_name = str(token_payload["user_name"]).strip()
+
+    raw_image = await image.read()
+    if len(raw_image) > settings.max_upload_size_bytes:
+        raise HTTPException(status_code=413, detail="Image exceeds max allowed size")
+
+    encoded = base64.b64encode(raw_image).decode("ascii")
+    return await _queue_photo(
+        r=app.state.redis,
+        pairing_id=pairing_id,
+        sender_name=sender_name,
+        mime_type=image.content_type,
+        image_b64=encoded,
+        ttl_seconds=ttl_seconds,
+    )
+
+
+@app.post("/photo/upload-b64", response_model=UploadResponse)
+async def upload_photo_b64(body: UploadB64Request) -> UploadResponse:
+    if body.ttl_hours < 1:
+        raise HTTPException(status_code=400, detail="ttl_hours must be >= 1")
+    ttl_seconds = min(body.ttl_hours * 3600, MAX_PHOTO_TTL_SECONDS)
+
+    mime = body.mime_type.strip()
+    if not mime.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are allowed")
+
+    token_payload = verify_pairing_token(body.auth_token)
+    if token_payload["pairing_id"] != body.pairing_id:
+        raise HTTPException(status_code=403, detail="Token does not match pairing")
+    sender_name = str(token_payload["user_name"]).strip()
+
+    try:
+        raw_image = base64.b64decode(body.image_b64, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid base64 image data") from exc
+
+    if len(raw_image) > settings.max_upload_size_bytes:
+        raise HTTPException(status_code=413, detail="Image exceeds max allowed size")
+
+    return await _queue_photo(
+        r=app.state.redis,
+        pairing_id=body.pairing_id,
+        sender_name=sender_name,
+        mime_type=mime,
+        image_b64=body.image_b64,
+        ttl_seconds=ttl_seconds,
+    )
 
 
 @app.get("/check_photo/{pairing_id}")

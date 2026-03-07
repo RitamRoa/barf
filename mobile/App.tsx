@@ -355,7 +355,8 @@ export default function App() {
       selected = await ImagePicker.launchCameraAsync({
         allowsEditing: true,
         quality: 0.85,
-        mediaTypes: ["images"]
+        mediaTypes: ["images"],
+        base64: true
       });
     } else {
       const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -367,7 +368,8 @@ export default function App() {
       selected = await ImagePicker.launchImageLibraryAsync({
         allowsEditing: true,
         quality: 0.85,
-        mediaTypes: ["images"]
+        mediaTypes: ["images"],
+        base64: true
       });
     }
 
@@ -382,6 +384,7 @@ export default function App() {
         pairingId: pairing.pairingId,
         authToken: pairing.authToken,
         imageUri: asset.uri,
+        imageB64: asset.base64 ?? null,
         mimeType,
         ttlHours
       });
