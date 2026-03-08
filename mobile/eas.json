@@ -1,0 +1,23 @@
+{
+  "cli": {
+    "version": ">= 16.0.0"
+  },
+  "build": {
+    "preview": {
+      "env": {
+        "EXPO_PUBLIC_API_BASE": "https://barf-9j5d.onrender.com"
+      },
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "production": {
+      "env": {
+        "EXPO_PUBLIC_API_BASE": "https://barf-9j5d.onrender.com"
+      },
+      "android": {
+        "buildType": "app-bundle"
+      }
+    }
+  }
+}

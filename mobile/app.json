@@ -6,6 +6,13 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "icon": "./assets/icon.png",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#111111"
+    },
     "assetBundlePatterns": [
       "**/*"
     ],
@@ -13,12 +20,26 @@
       "supportsTablet": true
     },
     "android": {
+      "package": "com.rithamroa.barf",
       "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#111111"
-      }
+      },
+      "edgeToEdgeLayoutEnabled": true
     },
     "plugins": [
-      "expo-image-picker"
-    ]
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow barf to access your photos.",
+          "cameraPermission": "Allow barf to access your camera."
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "54c605d3-4d18-4d98-a734-7e73bd67b959"
+      }
+    }
   }
 }

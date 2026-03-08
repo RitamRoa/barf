@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { Component, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -37,6 +37,37 @@ type UiPhoto = {
   expiresAtMs: number;
 };
 
+class ErrorBoundary extends Component<
+  { children: React.ReactNode },
+  { hasError: boolean }
+> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <SafeAreaView style={{ flex: 1, backgroundColor: "#0D0D0D", alignItems: "center", justifyContent: "center", padding: 24 }}>
+          <StatusBar barStyle="light-content" />
+          <Text style={{ color: "#FFA6A6", fontSize: 16, textAlign: "center", marginBottom: 8 }}>
+            Something went wrong.
+          </Text>
+          <Text style={{ color: "#B7AE9C", fontSize: 13, textAlign: "center" }}>
+            Please close and reopen the app.
+          </Text>
+        </SafeAreaView>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 function toUiPhoto(payload: PhotoPayload): UiPhoto {
   return {
     photoId: payload.photo_id,
@@ -62,7 +93,7 @@ function formatRemaining(totalSeconds: number): string {
   return `${d} day${d !== 1 ? "s" : ""} left`;
 }
 
-export default function App() {
+function AppContent() {
   const [loading, setLoading] = useState(true);
   const [pairing, setPairing] = useState<PairingState | null>(null);
 
@@ -513,7 +544,11 @@ export default function App() {
           {photos.length > 0 ? (
             <Pressable onPress={() => setViewerVisible(true)} style={styles.photoRow}>
               <View style={styles.photoThumb}>
-                <Image source={{ uri: `data:${photos[0].mimeType};base64,${photos[0].imageB64}` }} style={styles.photoThumbImg} />
+                <Image
+                  source={{ uri: `data:${photos[0].mimeType};base64,${photos[0].imageB64}` }}
+                  style={styles.photoThumbImg}
+                  onError={() => {}}
+                />
                 <View style={styles.photoThumbOverlay}>
                   <Text style={styles.photoThumbIcon}>🔍</Text>
                 </View>
@@ -584,7 +619,14 @@ export default function App() {
           <Pressable style={styles.viewerDismiss} onPress={() => { void dismissViewer(); }}>
             <Text style={styles.viewerDismissText}>Close</Text>
           </Pressable>
-          {photos[0] ? <Image source={{ uri: `data:${photos[0].mimeType};base64,${photos[0].imageB64}` }} style={styles.viewerImage} /> : null}
+          {photos[0] ? (
+            <Image
+              source={{ uri: `data:${photos[0].mimeType};base64,${photos[0].imageB64}` }}
+              style={styles.viewerImage}
+              resizeMode="contain"
+              onError={() => { void dismissViewer(); }}
+            />
+          ) : null}
         </View>
       </Modal>
     </SafeAreaView>
@@ -869,8 +911,7 @@ const styles = StyleSheet.create({
   viewerImage: {
     width: "100%",
     height: "82%",
-    borderRadius: theme.radius.lg,
-    resizeMode: "contain"
+    borderRadius: theme.radius.lg
   },
   viewerDismiss: {
     position: "absolute",
@@ -890,3 +931,11 @@ const styles = StyleSheet.create({
     fontWeight: "700"
   }
 });
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppContent />
+    </ErrorBoundary>
+  );
+}
